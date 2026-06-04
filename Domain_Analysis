@@ -1,0 +1,25 @@
+SecurityAlert
+| where TimeGenerated > ago(30d)
+| where ProviderName == 'MicrosoftEndPointDlp'
+| summarize arg_max(TimeGenerated, *) by SystemAlertId
+| extend Category = case(
+    AlertName has 'email', 'MailMessage',
+    AlertName has_all('document', 'OneDrive'), 'Document-OneDrive',
+    AlertName has_all('document', 'SharePoint'), 'Document-SharePoint',
+    'Unknown'
+)
+| extend Classification = coalesce(tostring(parse_json(ExtendedProperties).Classification), Status)
+| parse DisplayName with 'DLP policy (' DlpPolicy ') matched' *
+| summarize 
+    TagName = makeset(extract_all(@'TagName":"(.*?[^\"]+)"', Entities)), 
+    Recipient = makeset(extract_all(@'Recipient":"(.*?[^\"]+)"', Entities)), 
+    P1Sender = makeset(extract_all(@'P1Sender":"(.*?[^\"]+)"', Entities)), 
+    NetworkMessageId = makeset(extract_all(@'NetworkMessageId":"(.*?[^\"]+)"', Entities)), 
+    Directory = makeset(extract_all(@'Directory":"(.*?[^\"]+)"', Entities)), 
+    Subject = makeset(extract_all(@'Subject":"(.*?[^\"]+)"', Entities)), 
+    FileName = makeset(extract_all(@'Name":"([^"]+?)","CreatedTimeUtc"', Entities)) 
+    by SystemAlertId, TimeGenerated, StartTime, Category, DlpPolicy, Classification, Entities
+| mv-expand Recipient
+| extend Domain = extract(@"@(.+)", 1, tostring(Recipient))
+| summarize AlertCount = count() by Domain
+| order by AlertCount desc
