@@ -1,0 +1,431 @@
+# ======================================================================================
+# FULL TENANT-WIDE EXPORT OF:
+#  - DLP POLICIES (incl. normalized status)
+#  - DLP RULES (incl. normalized status)
+#  - REFERENCED SITS (AdvancedRule JSON + standard property fallback)
+#  - POLICY DEPLOYMENT LOCATIONS
+#  - DOMAIN CONDITIONS: RecipientDomainIs / SenderDomainIs (nested-safe)
+#  - ADVANCED RULE INVENTORY: all ConditionNames + flattened values (nested-safe)
+#
+# OUTPUT: CSV + JSON
+# ======================================================================================
+
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# 0. PREREQS: MODULE + SESSION + CMDLET CHECK
+# -----------------------------
+try {
+    Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
+} catch {
+    throw "ExchangeOnlineManagement module is not available. Install it with: Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force"
+}
+
+try {
+    Connect-IPPSSession -ErrorAction Stop | Out-Null
+} catch {
+    throw "Failed to connect via Connect-IPPSSession. Ensure permissions (Purview/DLP roles) and MFA. Error: $($_.Exception.Message)"
+}
+
+$missing = @()
+foreach ($c in @("Get-DlpCompliancePolicy","Get-DlpComplianceRule")) {
+    if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { $missing += $c }
+}
+if ($missing.Count -gt 0) {
+    throw "Missing required cmdlets after Connect-IPPSSession: $($missing -join ', '). Use Windows PowerShell 5.1 and ensure the session imports correctly."
+}
+
+Write-Host "`n=== Starting DLP → Rule → SIT Export (Enhanced + Domains + Nested AdvancedRule Inventory) ===`n"
+
+# -----------------------------
+# 1. EXPORT LOCATION
+# -----------------------------
+$export = "C:\Temp\DLP_Export"   # <-- CHANGE THIS
+if (!(Test-Path $export)) { New-Item -ItemType Directory -Path $export -Force | Out-Null }
+
+# -----------------------------
+# 2. GET POLICIES & RULES
+# -----------------------------
+$policies = Get-DlpCompliancePolicy
+$rules    = Get-DlpComplianceRule
+
+Write-Host "Retrieved $($policies.Count) policies"
+Write-Host "Retrieved $($rules.Count) rules"
+
+# Build fast policy lookup by GUID (avoid Where-Object in a loop)
+$policyByGuid = @{}
+foreach ($p in $policies) {
+    $policyByGuid[$p.Guid.ToString()] = $p
+}
+
+# -----------------------------
+# 3. NORMALIZE STATUS (Active / Simulation / Disabled)
+# -----------------------------
+function Normalize-DlpMode {
+    param([object] $Mode)
+    if ($null -eq $Mode) { return "Unknown" }
+    $m = $Mode.ToString().ToLowerInvariant()
+
+    if ($m -match "enforce") { return "Enforce" }
+    if ($m -match "testwithnotifications|withnotifications|notify") { return "TestWithNotifications" }
+    if ($m -match "testwithoutnotifications|withoutnotifications|silent|audit|simulation") { return "TestWithoutNotifications" }
+
+    return "Unknown"
+}
+
+function Normalize-DlpStatus {
+    param([object] $State, [object] $Mode)
+    $s  = if ($null -eq $State) { "" } else { $State.ToString().ToLowerInvariant() }
+    $nm = Normalize-DlpMode -Mode $Mode
+
+    if ($s -match "disabled") { return "Disabled" }
+    if ($nm -in @("TestWithNotifications","TestWithoutNotifications")) { return "Simulation" }
+    if ($nm -eq "Enforce") { return "Active" }
+    if ($s -match "enabled") { return "Active" }
+
+    return "Unknown"
+}
+
+# -----------------------------
+# 4. EXTRACT POLICY DEPLOYMENT LOCATIONS
+# -----------------------------
+function SafeCount {
+    param($obj)
+    if ($null -eq $obj) { return 0 }
+    try { return $obj.Count } catch { return 0 }
+}
+
+function Get-PolicyLocations {
+    param($policy)
+
+    if ($null -eq $policy) { return "Unknown (Policy not found)" }
+
+    $locs = @()
+
+    if ((SafeCount $policy.ExchangeLocation) -gt 0)               { $locs += "Exchange" }
+    if ((SafeCount $policy.SharePointLocation) -gt 0)             { $locs += "SharePoint" }
+    if ((SafeCount $policy.OneDriveLocation) -gt 0)               { $locs += "OneDrive" }
+    if ((SafeCount $policy.TeamsLocation) -gt 0)                  { $locs += "Teams" }
+    if ((SafeCount $policy.EndpointDlpLocation) -gt 0)            { $locs += "Endpoint" }
+    if ((SafeCount $policy.PowerBIDlpLocation) -gt 0)             { $locs += "PowerBI" }
+    if ((SafeCount $policy.ThirdPartyAppDlpLocation) -gt 0)       { $locs += "3rdPartyApps" }
+    if ((SafeCount $policy.OnPremisesScannerDlpLocation) -gt 0)   { $locs += "OnPremScanner" }
+
+    if ((SafeCount $policy.ExchangeAdaptiveScopes) -gt 0)         { $locs += "Exchange-AdaptiveScope" }
+    if ((SafeCount $policy.SharePointAdaptiveScopes) -gt 0)       { $locs += "SharePoint-AdaptiveScope" }
+    if ((SafeCount $policy.OneDriveAdaptiveScopes) -gt 0)         { $locs += "OneDrive-AdaptiveScope" }
+    if ((SafeCount $policy.TeamsAdaptiveScopes) -gt 0)            { $locs += "Teams-AdaptiveScope" }
+    if ((SafeCount $policy.EndpointDlpAdaptiveScopes) -gt 0)      { $locs += "Endpoint-AdaptiveScope" }
+
+    if ($locs.Count -eq 0) { return "None" }
+    return ($locs -join "; ")
+}
+
+# -----------------------------
+# 5. NESTED CONDITION WALKER
+#    Returns all nodes that have ConditionName and/or SubConditions
+# -----------------------------
+function Get-ConditionNodesRecursive {
+    param([object] $node)
+
+    $out = @()
+    if ($null -eq $node) { return $out }
+
+    $out += $node
+
+    if ($node.PSObject.Properties.Name -contains "SubConditions") {
+        foreach ($sc in ($node.SubConditions | ForEach-Object { $_ })) {
+            if ($null -ne $sc) {
+                $out += Get-ConditionNodesRecursive -node $sc
+            }
+        }
+    }
+
+    # Some shapes embed nested Condition object
+    if ($node.PSObject.Properties.Name -contains "Condition") {
+        $out += Get-ConditionNodesRecursive -node $node.Condition
+    }
+
+    return $out
+}
+
+# -----------------------------
+# 6. SIT EXTRACTION (nested-safe)
+# -----------------------------
+function Get-SITsFromRuleJson {
+    param($rule)
+
+    $results = @()
+    if (-not $rule.AdvancedRule) { return $results }
+
+    try {
+        $adv = $rule.AdvancedRule | ConvertFrom-Json
+    } catch {
+        Write-Warning "Failed to parse AdvancedRule JSON for rule: $($rule.Name)"
+        return $results
+    }
+
+    $nodes = Get-ConditionNodesRecursive -node $adv.Condition
+
+    foreach ($n in $nodes) {
+        if ($n.PSObject.Properties.Name -contains "ConditionName" -and $n.ConditionName -eq "ContentContainsSensitiveInformation") {
+            foreach ($val in ($n.Value | ForEach-Object { $_ })) {
+                foreach ($group in ($val.Groups | ForEach-Object { $_ })) {
+                    foreach ($st in ($group.Sensitivetypes | ForEach-Object { $_ })) {
+                        $results += $st
+                    }
+                }
+            }
+        }
+    }
+
+    return $results
+}
+
+function Get-SITsFromStandardProperty {
+    param($rule)
+
+    $results = @()
+    if ($null -eq $rule.ContentContainsSensitiveInformation) { return $results }
+
+    foreach ($st in $rule.ContentContainsSensitiveInformation) {
+        $results += [PSCustomObject]@{
+            Name          = $st.Name
+            Id            = $st.Id
+            MinConfidence = $st.MinConfidence
+            MaxConfidence = $st.MaxConfidence
+            MinCount      = $st.MinCount
+            MaxCount      = $st.MaxCount
+        }
+    }
+
+    return $results
+}
+
+# -----------------------------
+# 7. ADVANCED RULE INVENTORY (nested-safe)
+#    + RecipientDomainIs / SenderDomainIs extraction
+# -----------------------------
+function Flatten-Value {
+    param($v)
+
+    if ($null -eq $v) { return "" }
+    if ($v -is [string]) { return $v.Trim() }
+
+    if ($v -is [System.Collections.IEnumerable] -and -not ($v -is [string])) {
+        $parts = @()
+        foreach ($item in $v) { $parts += (Flatten-Value -v $item) }
+        return (($parts | Where-Object { $_ -ne "" } | Select-Object -First 200) -join ",")
+    }
+
+    $props = @("Value","Values","Pattern","Patterns","Domain","Domains","Address","Addresses","Name","Id")
+    $found = @()
+    foreach ($p in $props) {
+        if ($v.PSObject.Properties.Name -contains $p) {
+            $found += (Flatten-Value -v $v.$p)
+        }
+    }
+    if ($found.Count -gt 0) {
+        return (($found | Where-Object { $_ -ne "" } | Select-Object -First 200) -join ",")
+    }
+
+    try { return ($v | ConvertTo-Json -Compress -Depth 5) } catch { return $v.ToString() }
+}
+
+function Get-AdvancedRuleInventory {
+    param($rule)
+
+    $out = [PSCustomObject]@{
+        ConditionNames      = @()
+        ConditionsFlattened = @()
+        RecipientDomains    = @()
+        SenderDomains       = @()
+    }
+
+    if (-not $rule.AdvancedRule) { return $out }
+
+    try {
+        $adv = $rule.AdvancedRule | ConvertFrom-Json
+    } catch {
+        Write-Warning "Failed to parse AdvancedRule JSON for rule (inventory): $($rule.Name)"
+        return $out
+    }
+
+    $nodes = Get-ConditionNodesRecursive -node $adv.Condition
+
+    foreach ($n in $nodes) {
+        if (-not ($n.PSObject.Properties.Name -contains "ConditionName")) { continue }
+        $cn = [string]$n.ConditionName
+        if ([string]::IsNullOrWhiteSpace($cn)) { continue }
+
+        $out.ConditionNames += $cn
+
+        # Flatten Value (bounded for CSV)
+        $valFlat = ""
+        if ($n.PSObject.Properties.Name -contains "Value") {
+            $valFlat = Flatten-Value -v $n.Value
+        }
+
+        if ($valFlat) {
+            $valShort = if ($valFlat.Length -gt 2000) { $valFlat.Substring(0,2000) + "..." } else { $valFlat }
+            $out.ConditionsFlattened += ("{0}=[{1}]" -f $cn, $valShort)
+        }
+        else {
+            $out.ConditionsFlattened += ("{0}=[]" -f $cn)
+        }
+
+        # Convenience extracts
+        if ($cn -eq "RecipientDomainIs" -and ($n.PSObject.Properties.Name -contains "Value")) {
+            foreach ($d in ($n.Value | ForEach-Object { $_ })) {
+                if ($null -eq $d) { continue }
+                $out.RecipientDomains += $d.ToString().Trim().ToLowerInvariant()
+            }
+        }
+        elseif ($cn -eq "SenderDomainIs" -and ($n.PSObject.Properties.Name -contains "Value")) {
+            foreach ($d in ($n.Value | ForEach-Object { $_ })) {
+                if ($null -eq $d) { continue }
+                $out.SenderDomains += $d.ToString().Trim().ToLowerInvariant()
+            }
+        }
+    }
+
+    $out.ConditionNames      = $out.ConditionNames | Sort-Object -Unique
+    $out.ConditionsFlattened = $out.ConditionsFlattened | Sort-Object -Unique
+    $out.RecipientDomains    = $out.RecipientDomains | Sort-Object -Unique
+    $out.SenderDomains       = $out.SenderDomains | Sort-Object -Unique
+
+    return $out
+}
+
+# -----------------------------
+# 8. PROCESS EACH RULE
+# -----------------------------
+$exportRows = @()
+
+foreach ($rule in $rules) {
+
+    $parent = $null
+    if ($rule.Policy) {
+        $policyGuid = $rule.Policy.ToString()
+        if ($policyByGuid.ContainsKey($policyGuid)) {
+            $parent = $policyByGuid[$policyGuid]
+        }
+    }
+
+    $policyLocations = Get-PolicyLocations -policy $parent
+
+    # Status fields
+    $policyState = if ($parent) { $parent.State } else { $null }
+    $policyMode  = if ($parent) { $parent.Mode } else { $null }
+    $policyStatus = Normalize-DlpStatus -State $policyState -Mode $policyMode
+    $policyModeNorm = Normalize-DlpMode -Mode $policyMode
+
+    $ruleStatus = Normalize-DlpStatus -State $rule.State -Mode $rule.Mode
+    $ruleModeNorm = Normalize-DlpMode -Mode $rule.Mode
+
+    # SITs
+    $sitEntries = Get-SITsFromRuleJson -rule $rule
+    if ($sitEntries.Count -eq 0) { $sitEntries = Get-SITsFromStandardProperty -rule $rule }
+
+    # AdvancedRule inventory (nested-safe)
+    $advInv = Get-AdvancedRuleInventory -rule $rule
+    $recipientDomainsJoined = if ($advInv.RecipientDomains.Count -gt 0) { $advInv.RecipientDomains -join "; " } else { "" }
+    $senderDomainsJoined    = if ($advInv.SenderDomains.Count -gt 0)    { $advInv.SenderDomains -join "; " } else { "" }
+    $condNamesJoined        = if ($advInv.ConditionNames.Count -gt 0)   { $advInv.ConditionNames -join "; " } else { "" }
+    $condsFlatJoined        = if ($advInv.ConditionsFlattened.Count -gt 0) { $advInv.ConditionsFlattened -join " | " } else { "" }
+    $hasDomainConditions    = if (($advInv.RecipientDomains.Count + $advInv.SenderDomains.Count) -gt 0) { "YES" } else { "NO" }
+
+    if ($sitEntries.Count -eq 0) {
+        $exportRows += [PSCustomObject]@{
+            PolicyName           = if ($parent) { $parent.Name } else { "" }
+            PolicyGUID           = if ($parent) { $parent.Guid } else { $rule.Policy }
+            PolicyState          = $policyState
+            PolicyMode           = $policyMode
+            PolicyModeNormalized = $policyModeNorm
+            PolicyStatus         = $policyStatus
+            PolicyLocations      = $policyLocations
+
+            RuleName             = $rule.Name
+            RuleGUID             = $rule.Guid
+            RuleState            = $rule.State
+            RuleMode             = $rule.Mode
+            RuleModeNormalized   = $ruleModeNorm
+            RuleStatus           = $ruleStatus
+
+            AdvancedRulePresent             = if ($rule.AdvancedRule) { "YES" } else { "NO" }
+            AdvancedRuleConditionNames      = $condNamesJoined
+            AdvancedRuleConditionsFlattened = $condsFlatJoined
+
+            RecipientDomains     = $recipientDomainsJoined
+            SenderDomains        = $senderDomainsJoined
+            HasDomainConditions  = $hasDomainConditions
+            RecipientDomainCount = $advInv.RecipientDomains.Count
+            SenderDomainCount    = $advInv.SenderDomains.Count
+
+            SITName              = ""
+            SITID                = ""
+            MinConf              = ""
+            MaxConf              = ""
+            MinCount             = ""
+            MaxCount             = ""
+
+            Modified             = $rule.WhenChangedUTC
+        }
+    }
+    else {
+        foreach ($sit in $sitEntries) {
+            $exportRows += [PSCustomObject]@{
+                PolicyName           = if ($parent) { $parent.Name } else { "" }
+                PolicyGUID           = if ($parent) { $parent.Guid } else { $rule.Policy }
+                PolicyState          = $policyState
+                PolicyMode           = $policyMode
+                PolicyModeNormalized = $policyModeNorm
+                PolicyStatus         = $policyStatus
+                PolicyLocations      = $policyLocations
+
+                RuleName             = $rule.Name
+                RuleGUID             = $rule.Guid
+                RuleState            = $rule.State
+                RuleMode             = $rule.Mode
+                RuleModeNormalized   = $ruleModeNorm
+                RuleStatus           = $ruleStatus
+
+                AdvancedRulePresent             = if ($rule.AdvancedRule) { "YES" } else { "NO" }
+                AdvancedRuleConditionNames      = $condNamesJoined
+                AdvancedRuleConditionsFlattened = $condsFlatJoined
+
+                RecipientDomains     = $recipientDomainsJoined
+                SenderDomains        = $senderDomainsJoined
+                HasDomainConditions  = $hasDomainConditions
+                RecipientDomainCount = $advInv.RecipientDomains.Count
+                SenderDomainCount    = $advInv.SenderDomains.Count
+
+                SITName              = $sit.Name
+                SITID                = $sit.Id
+                MinConf              = $sit.MinConfidence
+                MaxConf              = $sit.MaxConfidence
+                MinCount             = $sit.MinCount
+                MaxCount             = $sit.MaxCount
+
+                Modified             = $rule.WhenChangedUTC
+            }
+        }
+    }
+}
+
+Write-Host "`n=== Exporting results... ===`n"
+
+# -----------------------------
+# 9. EXPORT FILES
+# -----------------------------
+$csvPath  = "$export\DLP_Rule_SIT_FullExport_WithDomains_AdvInventory_Nested.csv"
+$jsonPath = "$export\DLP_Rule_SIT_FullExport_WithDomains_AdvInventory_Nested.json"
+
+$exportRows | Export-Csv $csvPath -NoTypeInformation -Encoding UTF8
+$exportRows | ConvertTo-Json -Depth 25 | Out-File $jsonPath -Encoding UTF8
+
+Write-Host "CSV Export:  $csvPath"
+Write-Host "JSON Export: $jsonPath"
+
+Write-Host "`n=== DLP Export Complete ===`n"
+Disconnect-ExchangeOnline
