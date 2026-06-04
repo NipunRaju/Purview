@@ -1,0 +1,161 @@
+======================================================================================
+# FULL TENANT-WIDE EXPORT OF:
+#  - DLP POLICIES
+#  - DLP RULES
+#  - REFERENCED SENSITIVE INFORMATION TYPES (SITS)
+#  - POLICY DEPLOYMENT LOCATIONS (Exchange, SharePoint, OneDrive, Teams, Endpoint, etc.)
+#
+# OUTPUT: CSV + JSON
+# ======================================================================================
+
+Connect-IPPSSession
+
+Write-Host "`n=== Starting DLP → Rule → SIT Export ===`n"
+
+# -----------------------------
+# 1. EXPORT LOCATION
+# -----------------------------
+$export = "D:\Users\copilot6\Export"
+if (!(Test-Path $export)) { New-Item -ItemType Directory -Path $export }
+
+# -----------------------------
+# 2. GET POLICIES (INCLUDING LOCATIONS) & RULES
+# -----------------------------
+$policies = Get-DlpCompliancePolicy
+$rules    = Get-DlpComplianceRule
+
+Write-Host "Retrieved $($policies.Count) policies"
+Write-Host "Retrieved $($rules.Count) rules"
+
+# -----------------------------
+# 3. EXTRACT POLICY DEPLOYMENT LOCATIONS
+# -----------------------------
+function Get-PolicyLocations {
+    param($policy)
+
+    $locs = @()
+
+    if ($policy.ExchangeLocation.Count -gt 0)               { $locs += "Exchange" }
+    if ($policy.SharePointLocation.Count -gt 0)             { $locs += "SharePoint" }
+    if ($policy.OneDriveLocation.Count -gt 0)               { $locs += "OneDrive" }
+    if ($policy.TeamsLocation.Count -gt 0)                  { $locs += "Teams" }
+    if ($policy.EndpointDlpLocation.Count -gt 0)            { $locs += "Endpoint" }
+    if ($policy.PowerBIDlpLocation.Count -gt 0)             { $locs += "PowerBI" }
+    if ($policy.ThirdPartyAppDlpLocation.Count -gt 0)       { $locs += "3rdPartyApps" }
+    if ($policy.OnPremisesScannerDlpLocation.Count -gt 0)   { $locs += "OnPremScanner" }
+
+    # Adaptive scopes (new Purview model)
+    if ($policy.ExchangeAdaptiveScopes.Count -gt 0)         { $locs += "Exchange-AdaptiveScope" }
+    if ($policy.SharePointAdaptiveScopes.Count -gt 0)       { $locs += "SharePoint-AdaptiveScope" }
+    if ($policy.OneDriveAdaptiveScopes.Count -gt 0)         { $locs += "OneDrive-AdaptiveScope" }
+    if ($policy.TeamsAdaptiveScopes.Count -gt 0)            { $locs += "Teams-AdaptiveScope" }
+    if ($policy.EndpointDlpAdaptiveScopes.Count -gt 0)      { $locs += "Endpoint-AdaptiveScope" }
+
+    if ($locs.Count -eq 0) { return "None" }
+
+    return ($locs -join "; ")
+}
+
+# -----------------------------
+# 4. FUNCTION TO PARSE SITS FROM ADVANCED RULE JSON
+# -----------------------------
+function Get-SITsFromRuleJson {
+    param($rule)
+
+    $results = @()
+
+    if (-not $rule.AdvancedRule) { return $results }
+
+    try {
+        $adv = $rule.AdvancedRule | ConvertFrom-Json
+    } catch {
+        Write-Warning "Failed to parse AdvancedRule JSON for rule: $($rule.Name)"
+        return $results
+    }
+
+    if ($adv.Condition.SubConditions) {
+        foreach ($sub in $adv.Condition.SubConditions) {
+            if ($sub.ConditionName -eq "ContentContainsSensitiveInformation") {
+                foreach ($val in $sub.Value) {
+                    foreach ($group in $val.Groups) {
+                        foreach ($st in $group.Sensitivetypes) {
+                            $results += $st
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return $results
+}
+
+# -----------------------------
+# 5. PROCESS EACH RULE
+# -----------------------------
+$exportRows = @()
+
+foreach ($rule in $rules) {
+
+    # Find parent policy object
+    $parent = $policies | Where-Object { $_.Guid -eq $rule.Policy }
+
+    # Extract deployment locations
+    $policyLocations = Get-PolicyLocations -policy $parent
+
+    # Parse SIT references
+    $sitEntries = Get-SITsFromRuleJson -rule $rule
+
+    if ($sitEntries.Count -eq 0) {
+        # Rule has no SIT references
+        $exportRows += [PSCustomObject]@{
+            PolicyName     = $parent.Name
+            PolicyGUID     = $parent.Guid
+            PolicyLocations = $policyLocations
+            RuleName       = $rule.Name
+            RuleGUID       = $rule.Guid
+            SITName        = ""
+            SITID          = ""
+            MinConf        = ""
+            MaxConf        = ""
+            MinCount       = ""
+            MaxCount       = ""
+            Modified       = $rule.WhenChangedUTC
+        }
+    }
+    else {
+        foreach ($sit in $sitEntries) {
+            $exportRows += [PSCustomObject]@{
+                PolicyName      = $parent.Name
+                PolicyGUID      = $parent.Guid
+                PolicyLocations = $policyLocations
+                RuleName        = $rule.Name
+                RuleGUID        = $rule.Guid
+                SITName         = $sit.Name
+                SITID           = $sit.Id
+                MinConf         = $sit.MinConfidence
+                MaxConf         = $sit.MaxConfidence
+                MinCount        = $sit.MinCount
+                MaxCount        = $sit.MaxCount
+                Modified        = $rule.WhenChangedUTC
+            }
+        }
+    }
+}
+
+Write-Host "`n=== Exporting results... ===`n"
+
+# -----------------------------
+# 6. EXPORT FILES
+# -----------------------------
+$csvPath  = "$export\DLP_Rule_SIT_FullExport.csv"
+$jsonPath = "$export\DLP_Rule_SIT_FullExport.json"
+
+$exportRows | Export-Csv $csvPath -NoTypeInformation
+$exportRows | ConvertTo-Json -Depth 20 | Out-File $jsonPath
+
+Write-Host "CSV Export:  $csvPath"
+Write-Host "JSON Export: $jsonPath"
+
+Write-Host "`n=== DLP Export Complete ===`n"
+Disconnect-ExchangeOnline
