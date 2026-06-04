@@ -1,0 +1,112 @@
+Write-Host "Exporting Sensitive Information Types + Rule & Policy mapping..."
+Connect-IPPSSession
+# ------------------------
+# 1. SET EXPORT LOCATION
+# ------------------------
+$export = "D:\Users\copilot6\Export"
+if (!(Test-Path $export)) { New-Item -ItemType Directory -Path $export }
+
+# ------------------------
+# 2. GET ALL SIT DEFINITIONS
+# ------------------------
+$sits = Get-DlpSensitiveInformationType
+
+# ------------------------
+# 3. GET ALL DLP POLICIES & RULES
+# ------------------------
+$policies = Get-DlpCompliancePolicy | Select Name, Guid
+$rules    = Get-DlpComplianceRule
+
+# ------------------------
+# 4. BUILD LOOKUP: RULE → POLICY
+# ------------------------
+$ruleToPolicyMap = @{}
+foreach ($rule in $rules) {
+    $policy = $policies | Where-Object { $_.Guid -eq $rule.Policy }
+    $ruleToPolicyMap[$rule.Guid.ToString()] = $policy.Name
+}
+
+# ------------------------
+# 5. BUILD LOOKUP: SIT → RULES & POLICIES
+# ------------------------
+$sitUsage = @{}   # dict: sitId → { Rules = [], Policies = [] }
+
+foreach ($rule in $rules) {
+
+    if (-not $rule.AdvancedRule) { continue }
+
+    try {
+        $adv = $rule.AdvancedRule | ConvertFrom-Json
+    } catch {
+        continue
+    }
+
+    if ($adv.Condition.SubConditions) {
+        foreach ($sub in $adv.Condition.SubConditions) {
+            if ($sub.ConditionName -eq "ContentContainsSensitiveInformation") {
+
+                foreach ($val in $sub.Value) {
+                    foreach ($group in $val.Groups) {
+                        foreach ($st in $group.Sensitivetypes) {
+
+                            $sid = $st.Id.ToString()
+
+                            if (-not $sitUsage.ContainsKey($sid)) {
+                                $sitUsage[$sid] = [PSCustomObject]@{
+                                    Rules   = New-Object System.Collections.Generic.List[string]
+                                    Policies = New-Object System.Collections.Generic.List[string]
+                                }
+                            }
+
+                            # Add rule + policy name
+                            $sitUsage[$sid].Rules.Add($rule.Name)
+                            $sitUsage[$sid].Policies.Add($ruleToPolicyMap[$rule.Guid.ToString()])
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ------------------------
+# 6. BUILD CLEAN EXPORT OBJECT
+# ------------------------
+$cleanSITs = foreach ($sit in $sits) {
+
+    $sid = $sit.Id.ToString()
+
+    # Convert hashtable keyword/regex into flat strings
+    $keywords = $sit.MatchDetails.Keywords
+    if ($keywords -is [System.Collections.IDictionary]) {
+        $keywords = $keywords.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+    }
+
+    $regexes = $sit.MatchDetails.RegularExpressions
+    if ($regexes -is [System.Collections.IDictionary]) {
+        $regexes = $regexes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+    }
+
+    # Rule/policy mapping
+    $ruleList   = $sitUsage[$sid].Rules   -join "; " 
+    $policyList = $sitUsage[$sid].Policies -join "; "
+
+    [PSCustomObject]@{
+        SIT_Name         = $sit.Name
+        SIT_Id           = $sit.Id
+        Publisher        = $sit.Publisher
+        Description      = $sit.Description
+        RulePackId       = $sit.RulePackId
+        UsedInRules      = $ruleList
+        UsedInPolicies   = $policyList
+    }
+}
+
+# ------------------------
+# 7. EXPORT FILES
+# ------------------------
+$cleanSITs | ConvertTo-Json -Depth 20 | Out-File "$export\SITs_With_Rules_Policies.json"
+$cleanSITs | Export-Csv "$export\SITs_With_Rules_Policies.csv" -NoTypeInformation
+
+Write-Host "Enhanced SIT export complete. Files saved to $export."
+Disconnect-ExchangeOnline
