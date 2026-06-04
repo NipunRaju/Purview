@@ -1,0 +1,44 @@
+let AlertsExactBase=SecurityAlert
+| where DisplayName has "DLP"
+| project TimeGenerated,AlertId=tostring(SystemAlertId),DisplayName
+| summarize arg_max(TimeGenerated,DisplayName) by AlertId
+// we are using 2 patterns, second one to detect nvs priv policy
+| extend DlpPolicyRaw=coalesce(extract(@"DLP policy \(([^)]+)\)",1,DisplayName),extract(@"DLP[-\s]+([A-Za-z0-9][A-Za-z0-9 _-]+)",1,DisplayName))
+| extend DlpPolicyClean=trim(" ",replace_string(DlpPolicyRaw,"DLP-","DLP "))
+| extend DlpPolicy=iif(isempty(DlpPolicyClean),"Unknown/Other",DlpPolicyClean)
+| project AlertId,DlpPolicy;
+let PolicyAlerts=AlertsExactBase
+| summarize PolicyAlerts=count() by DlpPolicy;
+let IncidentLatest=SecurityIncident
+| summarize arg_max(TimeGenerated,Severity) by IncidentNumber
+| project IncidentNumber,Severity=tostring(Severity);
+let IncidentAlertPairs=SecurityIncident
+| mv-expand AlertIds
+| extend AlertId=tostring(AlertIds)
+| summarize by IncidentNumber,AlertId;
+let IncidentPolicyPairs=IncidentAlertPairs
+| join kind=inner (AlertsExactBase) on AlertId
+| project IncidentNumber,DlpPolicy
+| distinct IncidentNumber,DlpPolicy
+| join kind=leftouter IncidentLatest on IncidentNumber;
+let PolicyIncidents=IncidentPolicyPairs
+| summarize PolicyIncidents=count() by DlpPolicy;
+let SevBreakdown=IncidentPolicyPairs
+| summarize Incidents=count() by DlpPolicy,Severity
+| evaluate pivot(Severity,sum(Incidents));
+let Final=PolicyAlerts
+| join kind=leftouter PolicyIncidents on DlpPolicy
+| join kind=leftouter SevBreakdown on DlpPolicy
+| order by PolicyIncidents desc,PolicyAlerts desc;
+let GlobalAlertsExact=SecurityAlert
+| where DisplayName has "DLP"
+| summarize by AlertId=tostring(SystemAlertId)
+| summarize PolicyAlerts=count()
+| extend DlpPolicy="Total";
+let GlobalIncidentsExact=SecurityIncident
+| where Title has_any (dynamic(["DLP policy (","Data loss prevention","DLP ","exfiltration incident"]))
+| summarize by IncidentNumber
+| summarize PolicyIncidents=count()
+| extend DlpPolicy="Total";
+Final
+| union (GlobalAlertsExact | join kind=fullouter GlobalIncidentsExact on DlpPolicy)
